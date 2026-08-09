@@ -1,11 +1,34 @@
-wandb
-__pycache__
-.vscode
-notebooks
-results
-*.ipynb_checkpoints
-eval_results
-tests
-.DS_Store
-gradio.sh
-data_example
+# ===== 大文件/缓存/产物，一律不入库 =====
+# 模型权重与缓存
+models/
+hf_home/
+LMUData/
+cache/
+fa_build/
+
+# 评测产物与训练结果
+eval_outputs/
+results/
+
+# 第三方仓库（各自有独立 git 历史）
+VLMEvalKit/
+gen_eval/ELLA/
+
+# 生成评测的图片输出与大体积数据集文件
+gen_eval/images/
+gen_eval/prompts/qwen_image_bench_hf_v0518.jsonl
+
+# 示例输出
+bagel_example/
+bagel_example_overfit/
+bagel_example.zip
+
+# 日志与调试产物
+*.log
+nccl_trace_rank*
+core.*
+
+# 杂项生成文件
+tags
+__pycache__/
+*.pyc

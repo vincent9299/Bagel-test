@@ -273,9 +273,26 @@ def patch_bagel_flash_attention():
             kwargs.pop("attn_modes")
             kwargs["sample_lens"] = sample_lens
             kwargs["nested_attention_masks"] = _FLASH_SENTINEL
+            # pure-VLM batches carry no generation data while the official
+            # forward gates the gen branch only on config.visual_gen; flip it
+            # off for this call (restored in finally) instead of patching
+            # the source.
+            skip_gen = kwargs.get("padded_latent") is None
+            if skip_gen:
+                self.config.visual_gen = False
+            # pure-generation (t2i) batches carry no ViT input while the
+            # official forward gates the und branch only on config.visual_und
+            _vts = kwargs.get("vit_token_seqlens")
+            skip_und = _vts is None or (hasattr(_vts, "numel") and _vts.numel() == 0)
+            if skip_und:
+                self.config.visual_und = False
             try:
                 return orig_bagel_forward(self, *args, **kwargs)
             finally:
+                if skip_gen:
+                    self.config.visual_gen = True
+                if skip_und:
+                    self.config.visual_und = True
                 kwargs["nested_attention_masks"] = None
         return orig_bagel_forward(self, *args, **kwargs)
 

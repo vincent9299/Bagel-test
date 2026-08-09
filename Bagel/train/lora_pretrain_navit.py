@@ -79,8 +79,64 @@ def patch_dataset_paths(example_data_dir: str):
     races truncating/reading a half-written file."""
     import data.dataset_info as dataset_info
     di = dataset_info.DATASET_INFO
+    # Deterministic edit layout: the official parse_row randomly chooses how
+    # many edit steps to use, which changes the sequence length every sample
+    # and forces flex-attention to re-JIT-compile every step (>10 min/rank,
+    # NCCL watchdog aborts). Pin the RNG per sample so shapes stay stable
+    # (this is an overfit sanity run; runtime patch, no source edit).
+    import random as _random
+    from data.interleave_datasets.edit_dataset import (
+        UnifiedEditIterableDataset as _UnifiedEditDS)
+    if not getattr(_UnifiedEditDS.parse_row, '_det_patched', False):
+        _orig_parse_row = _UnifiedEditDS.parse_row
+
+        def _det_parse_row(self, row):
+            _state = _random.getstate()
+            _random.seed(1234)
+            try:
+                return _orig_parse_row(self, row)
+            finally:
+                _random.setstate(_state)
+
+        _det_parse_row._det_patched = True
+        _UnifiedEditDS.parse_row = _det_parse_row
+    # Zero CFG condition-dropout probs: pack_sequence randomly drops the
+    # vit/vae/text condition with these probs (vit: 0.4!), independently per
+    # rank. That changes which modules run under FSDP and desyncs the
+    # collective sequence across ranks (NCCL deadlock). Official mixed
+    # training tolerates it via the mandatory t2i dataset; pure-edit overfit
+    # cannot. Deterministic full-condition batches are fine for overfitting.
+    from data.dataset_base import DataConfig as _DataConfig
+    _orig_dc_init = _DataConfig.__init__
+    def _dc_init_no_cfg_dropout(self, *a, **kw):
+        kw.setdefault('text_cond_dropout_prob', 0.0)
+        kw.setdefault('vit_cond_dropout_prob', 0.0)
+        kw.setdefault('vae_cond_dropout_prob', 0.0)
+        _orig_dc_init(self, *a, **kw)
+        self.text_cond_dropout_prob = 0.0
+        self.vit_cond_dropout_prob = 0.0
+        self.vae_cond_dropout_prob = 0.0
+    if not getattr(_DataConfig.__init__, '_cfg_patched', False):
+        _dc_init_no_cfg_dropout._cfg_patched = True
+        _DataConfig.__init__ = _dc_init_no_cfg_dropout
     di['t2i_pretrain']['t2i']['data_dir'] = os.path.join(example_data_dir, 't2i')
+    # register a second t2i entry pointing at the same dir so multi-rank
+    # runs can shard data_dirs across ranks (official get_parquet_data_paths
+    # splits the *dir list*, a single dir leaves rank>0 empty and deadlocks
+    # the packing loop). Only used by configs that list 't2i_2'.
+    di['t2i_pretrain']['t2i_2'] = {
+        'data_dir': os.path.join(example_data_dir, 't2i'),
+        'num_files': di['t2i_pretrain']['t2i'].get('num_files', 1),
+        'num_total_samples': di['t2i_pretrain']['t2i'].get('num_total_samples', 2),
+    }
     di['unified_edit']['seedxedit_multi']['data_dir'] = os.path.join(example_data_dir, 'editing/seedxedit_multi')
+    # same rank-sharding workaround as t2i_2 above: a second edit entry so
+    # each rank owns at least one data dir. Only used by configs listing it.
+    di['unified_edit']['seedxedit_multi_2'] = {
+        'data_dir': os.path.join(example_data_dir, 'editing/seedxedit_multi'),
+        'num_files': di['unified_edit']['seedxedit_multi'].get('num_files', 1),
+        'num_total_samples': di['unified_edit']['seedxedit_multi'].get('num_total_samples', 2),
+    }
     # The shipped parquet_info json uses 'your_data_path' placeholder keys; the
     # dataset code matches real file paths against those keys, so rewrite them
     # into a fixed copy (original data files are left untouched).
@@ -97,6 +153,7 @@ def patch_dataset_paths(example_data_dir: str):
         os.rename(tmp_info, dst_info)
     dist.barrier()
     di['unified_edit']['seedxedit_multi']['parquet_info_path'] = dst_info
+    di['unified_edit']['seedxedit_multi_2']['parquet_info_path'] = dst_info
     di['vlm_sft']['llava_ov']['data_dir'] = os.path.join(example_data_dir, 'vlm/images')
     di['vlm_sft']['llava_ov']['jsonl_path'] = os.path.join(example_data_dir, 'vlm/llava_ov_si.jsonl')
 
@@ -154,7 +211,10 @@ def fsdp_wrapper_lora(original_model, fsdp_config):
 
 def main():
     assert torch.cuda.is_available()
-    dist.init_process_group("nccl")
+    # flex-attention JIT-compiles per new sequence shape and compilation can
+    # exceed the default 600s NCCL watchdog on the first steps; give it room
+    import datetime as _dt
+    dist.init_process_group("nccl", timeout=_dt.timedelta(hours=3))
     device = dist.get_rank() % torch.cuda.device_count()
     torch.cuda.set_device(device)
     parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments, LoRAArguments))
@@ -364,6 +424,13 @@ def main():
         dataset_config.text_cond_dropout_prob = model_args.text_cond_dropout_prob
         dataset_config.vae_cond_dropout_prob = model_args.vae_cond_dropout_prob
         dataset_config.vit_cond_dropout_prob = model_args.vit_cond_dropout_prob
+    # [cfg-patch] the block above re-injects ModelArguments dropout probs
+    # (0.1/0.3/0.3) AFTER DataConfig construction, undoing the zeroed
+    # values. Per-rank independent condition dropout makes FSDP ranks run
+    # different compute graphs -> NCCL deadlock. Force zero again here.
+    dataset_config.text_cond_dropout_prob = 0.0
+    dataset_config.vae_cond_dropout_prob = 0.0
+    dataset_config.vit_cond_dropout_prob = 0.0
     train_dataset = PackedDataset(
         dataset_config,
         tokenizer=tokenizer,
@@ -417,23 +484,37 @@ def main():
         tokens_tensor = torch.tensor(float(data['sequence_length']), device=device)
         dist.all_reduce(tokens_tensor, op=dist.ReduceOp.SUM)
         token_window += tokens_tensor.item()
-        if data['sample_lens']:
-            sample_lens_tensor = torch.tensor(data['sample_lens'], dtype=torch.float32, device=device)
-            sample_square = torch.dot(sample_lens_tensor, sample_lens_tensor)
-            dist.all_reduce(sample_square, op=dist.ReduceOp.SUM)
-            seqlen_square_window += sample_square.item()
+        # NOTE: collective ops must run on ALL ranks unconditionally (data
+        # content may differ across ranks); use zero contributions instead
+        sample_lens_tensor = torch.tensor(data['sample_lens'] or [0.0], dtype=torch.float32, device=device)
+        sample_square = torch.dot(sample_lens_tensor, sample_lens_tensor)
+        dist.all_reduce(sample_square, op=dist.ReduceOp.SUM)
+        seqlen_square_window += sample_square.item()
 
-        with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
-            if training_args.visual_gen:
-                with torch.no_grad():
-                    data['padded_latent'] = vae_model.encode(data.pop('padded_images'))
-            loss_dict = fsdp_model(**data)
+        try:
+            with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
+                if training_args.visual_gen and 'padded_images' in data:
+                    # pure-VLM batches carry no generation images (official mixed
+                    # config always includes a mandatory t2i dataset, we don't)
+                    with torch.no_grad():
+                        data['padded_latent'] = vae_model.encode(data.pop('padded_images'))
+                loss_dict = fsdp_model(**data)
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+            if "out of memory" in str(e).lower():
+                logger.error(
+                    f"CUDA OOM at step {curr_step}: sample_lens={data.get('sample_lens')}, "
+                    f"seq={data['packed_text_ids'].shape}, "
+                    f"vit_tokens={None if data.get('packed_vit_tokens') is None else data['packed_vit_tokens'].shape}, "
+                    f"allocated={torch.cuda.memory_allocated()/2**30:.1f}GB")
+                torch.cuda.empty_cache()
+            raise
 
         loss = 0
         ce = loss_dict["ce"]
+        total_ce_tokens = torch.tensor(
+            len(data['ce_loss_indexes']) if ce is not None else 0, device=device)
+        dist.all_reduce(total_ce_tokens, op=dist.ReduceOp.SUM)
         if ce is not None:
-            total_ce_tokens = torch.tensor(len(data['ce_loss_indexes']), device=device)
-            dist.all_reduce(total_ce_tokens, op=dist.ReduceOp.SUM)
             if training_args.ce_loss_reweighting:
                 ce = ce * ce_loss_weights
                 total_ce_loss_weights = ce_loss_weights.sum()
@@ -444,14 +525,18 @@ def main():
             loss_dict["ce"] = ce.detach()
             loss = loss + ce * training_args.ce_weight
         else:
-            assert not training_args.visual_und
+            # pure-generation (t2i) batches legitimately have no CE tokens
             loss_dict["ce"] = torch.tensor(0, device=device)
             total_ce_tokens = torch.tensor(0, device=device)
 
-        if training_args.visual_gen:
+        # pure-VLM batches have no generation tokens -> mse is None; keep the
+        # collective unconditional across ranks
+        _has_mse = training_args.visual_gen and loss_dict.get("mse") is not None
+        total_mse_tokens = torch.tensor(
+            len(data['mse_loss_indexes']) if _has_mse else 0, device=device)
+        dist.all_reduce(total_mse_tokens, op=dist.ReduceOp.SUM)
+        if _has_mse:
             mse = loss_dict["mse"]
-            total_mse_tokens = torch.tensor(len(data['mse_loss_indexes']), device=device)
-            dist.all_reduce(total_mse_tokens, op=dist.ReduceOp.SUM)
             mse = mse.mean(dim=-1).sum() * dist.get_world_size() / total_mse_tokens
             loss_dict["mse"] = mse.detach()
             loss = loss + mse * training_args.mse_weight
