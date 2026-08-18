@@ -8,22 +8,25 @@
 
 | 链路 | 实测速度 |
 |---|---|
-| 目标机 → huggingface.co 官方 | ~307 B/s（不可用，必须走镜像） |
+| 目标机 → huggingface.co 官方 | ~307 B/s（不可用，HF 只作为最后兜底且必须走镜像） |
 | 目标机 → hf-mirror.com | ~1.4 MB/s |
-| 目标机 → modelscope.cn | 可达（未测速，建议优先测） |
+| 目标机 → modelscope.cn | 可达（国内 CDN，预期最快，未测速，开工前先测） |
 
-- 所有 HF 下载必须设置 `export HF_ENDPOINT=https://hf-mirror.com`
+**下载源选择策略（铁律）：能走 ModelScope 的一律先走 ModelScope，ModelScope 没有的再走 hf-mirror，HF 官方域名禁用。**
+
+- ModelScope 下载：`pip install modelscope` 后用 `modelscope download`（数据集加 `--dataset` 参数）
+- HF 兜底下载必须设置 `export HF_ENDPOINT=https://hf-mirror.com`
 - 建议每个下载用 `setsid nohup ... > xxx.log 2>&1 &` 后台跑 + 重试循环
 
 ## 0.1 下载落盘路径总表（绝对路径，直接下到对应位置）
 
 | 优先级 | 内容 | 来源 | 精确落盘路径（目标机绝对路径） | 大小 |
 |---|---|---|---|---|
-| P0 | BAGEL-7B-MoT 权重 | ModelScope `bytedance-Seed/BAGEL-7B-MoT` | `/tank/bagel/models/BAGEL-7B-MoT/` | 28G |
-| P0 | Qwen-Image-Bench 提示词 | HF dataset `Qwen/Qwen-Image-Bench` | `/tank/bagel/gen_eval/prompts/qwen_image_bench_hf_v0518.jsonl`（单文件） | 176M |
-| P1 | mplug 评分模型 | ModelScope `damo/mplug_visual-question-answering_coco_large_en` | `/tank/bagel/cache/modelscope/models/damo--mplug_visual-question-answering_coco_large_en/snapshots/master/` | 2.8G |
-| P2 | MME-RealWorld-Base64 | HF dataset `yifanzhang114/MME-RealWorld-Base64` | `/tank/bagel/hf_home/`（用 HF_HOME 控制） | 41G |
-| P2 | LMUData | VLMEvalKit 自动下载 | `/tank/bagel/LMUData/` | 42G |
+| P0 | BAGEL-7B-MoT 权重 | **ModelScope** `bytedance-Seed/BAGEL-7B-MoT` | `/tank/bagel/models/BAGEL-7B-MoT/` | 28G |
+| P0 | Qwen-Image-Bench 提示词 | **ModelScope dataset** `Qwen/Qwen-Image-Bench`（官方同步镜像） | `/tank/bagel/gen_eval/prompts/qwen_image_bench_hf_v0518.jsonl`（单文件） | 176M |
+| P1 | mplug 评分模型 | **ModelScope** `damo/mplug_visual-question-answering_coco_large_en` | `/tank/bagel/cache/modelscope/models/damo--mplug_visual-question-answering_coco_large_en/snapshots/master/` | 2.8G |
+| P2 | MME-RealWorld-Base64 | 先在 ModelScope 搜镜像，找不到再 hf-mirror `yifanzhang114/MME-RealWorld-Base64` | `/tank/bagel/hf_home/`（用 HF_HOME 控制） | 41G |
+| P2 | LMUData | VLMEvalKit 自动下载（其内部源自行配置镜像） | `/tank/bagel/LMUData/` | 42G |
 | P2 | VLMEvalKit 仓库 | GitHub `open-compass/VLMEvalKit` | `/tank/bagel/VLMEvalKit/`（git clone） | 20M |
 | P2 | ELLA 第三方仓库 | GitHub `TencentARC/ELLA` | `/tank/bagel/gen_eval/ELLA/`（git clone，本机原本也是克隆使用） | 13M |
 
@@ -44,12 +47,19 @@ modelscope download --model bytedance-Seed/BAGEL-7B-MoT \
 
 ## 2. Qwen-Image-Bench 提示词（176M）→ `gen_eval/prompts/`
 
-来源：HF dataset `Qwen/Qwen-Image-Bench`（走 hf-mirror）。
-仓库里已有下载脚本，改一下 local_dir 即可：`gen_eval/scripts/dl_qib.py`
+来源：**ModelScope dataset `Qwen/Qwen-Image-Bench`**（官方宣布与 HF 同步开源，优先走这里）：
+
+```bash
+modelscope download --dataset Qwen/Qwen-Image-Bench \
+  qwen_image_bench_hf_v0518.jsonl \
+  --local_dir /tank/bagel/gen_eval/prompts
+```
+
+若 ModelScope 上找不到该文件，兜底走 hf-mirror（仓库里已有脚本 `gen_eval/scripts/dl_qib.py`，改 local_dir 为 `/tank/bagel/gen_eval/prompts`）：
 
 ```bash
 export HF_ENDPOINT=https://hf-mirror.com
-python gen_eval/scripts/dl_qib.py   # 记得把脚本内 local_dir 改为 /tank/bagel/gen_eval/prompts
+python gen_eval/scripts/dl_qib.py
 ```
 
 产物：`gen_eval/prompts/qwen_image_bench_hf_v0518.jsonl`（176M，该文件已被 gitignore，必须下载）。
@@ -57,14 +67,18 @@ qib_prompts.jsonl 已随仓库推送，无需下载。
 
 ## 3. MME-RealWorld-Base64 数据集（blob 实际 ~41G）→ `hf_home/`
 
-来源：HF dataset `yifanzhang114/MME-RealWorld-Base64`。
-必须用 `HF_HOME` 控制落盘位置，保证与本机缓存布局一致：
+来源：HF dataset `yifanzhang114/MME-RealWorld-Base64`。开工前先在 ModelScope 搜 `MME-RealWorld`，
+如有 Base64 版镜像则优先用 `modelscope download --dataset`；找不到再走 hf-mirror。
+走 HF 时必须用 `HF_HOME` 控制落盘位置，保证与本机缓存布局一致：
 
 ```bash
 export HF_ENDPOINT=https://hf-mirror.com
 export HF_HOME=/tank/bagel/hf_home
 huggingface-cli download --repo-type dataset yifanzhang114/MME-RealWorld-Base64
 ```
+
+注意：若从 ModelScope 下载，下完后需手工摆成上述 HF 缓存布局（datasets--yifanzhang114--MME-RealWorld-Base64/snapshots+blobs），
+或者把评测脚本的数据读取路径改为 ModelScope 落盘路径（本机 gen_eval/scripts/dl_mme_rw.py 可作参考）。
 
 校验：`/tank/bagel/hf_home/hub/datasets--yifanzhang114--MME-RealWorld-Base64/blobs/` 总量 ≈ 41G。
 注意：主文件 MME-RealWorld.tsv 单文件 33G，下载脚本要有断点续传/重试（huggingface-cli 自带续传）。
