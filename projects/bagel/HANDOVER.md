@@ -17,6 +17,20 @@
 - 所有 HF 下载必须设置 `export HF_ENDPOINT=https://hf-mirror.com`
 - 建议每个下载用 `setsid nohup ... > xxx.log 2>&1 &` 后台跑 + 重试循环
 
+## 0.1 下载落盘路径总表（绝对路径，直接下到对应位置）
+
+| 优先级 | 内容 | 来源 | 精确落盘路径（目标机绝对路径） | 大小 |
+|---|---|---|---|---|
+| P0 | BAGEL-7B-MoT 权重 | ModelScope `bytedance-Seed/BAGEL-7B-MoT` | `/root/bagel/models/BAGEL-7B-MoT/` | 28G |
+| P0 | Qwen-Image-Bench 提示词 | HF dataset `Qwen/Qwen-Image-Bench` | `/root/bagel/gen_eval/prompts/qwen_image_bench_hf_v0518.jsonl`（单文件） | 176M |
+| P1 | mplug 评分模型 | ModelScope `damo/mplug_visual-question-answering_coco_large_en` | `/root/bagel/cache/modelscope/models/damo--mplug_visual-question-answering_coco_large_en/snapshots/master/` | 2.8G |
+| P2 | MME-RealWorld-Base64 | HF dataset `yifanzhang114/MME-RealWorld-Base64` | 下到 `/tank/bagel_data/hf_home/`，再 `ln -s /tank/bagel_data/hf_home /root/bagel/hf_home` | 41G |
+| P2 | LMUData | VLMEvalKit 自动下载 | 下到 `/tank/bagel_data/LMUData/`，再 `ln -s /tank/bagel_data/LMUData /root/bagel/LMUData` | 42G |
+| P2 | VLMEvalKit 仓库 | GitHub `open-compass/VLMEvalKit` | `/root/bagel/VLMEvalKit/`（git clone） | 20M |
+
+> P0+P1 合计约 31G，`/`（剩 ~60G）放得下；P2 两项共 83G 必须放 `/tank`，
+> 用软链挂回 `/root/bagel/` 下，脚本里的路径就不用改。
+
 ## 1. BAGEL-7B-MoT 基座权重（28G）→ `models/BAGEL-7B-MoT/`
 
 来源：**ModelScope** `bytedance-Seed/BAGEL-7B-MoT`（本机即从 ModelScope 下载，目录里有 configuration.json 为证）
@@ -43,18 +57,20 @@ python gen_eval/scripts/dl_qib.py   # 记得把脚本内 local_dir 改为 /root/
 产物：`gen_eval/prompts/qwen_image_bench_hf_v0518.jsonl`（176M，该文件已被 gitignore，必须下载）。
 qib_prompts.jsonl 已随仓库推送，无需下载。
 
-## 3. MME-RealWorld-Base64 数据集（blob 实际 ~41G）→ `hf_home/`（建议放 /tank）
+## 3. MME-RealWorld-Base64 数据集（blob 实际 ~41G）→ 软链 `hf_home/`（实体放 /tank）
 
 来源：HF dataset `yifanzhang114/MME-RealWorld-Base64`。
-必须用 `HF_HOME` 指到项目内，保证与本机缓存布局一致（/ 空间不够时先下到 /tank 再软链）：
+必须用 `HF_HOME` 控制落盘位置，保证与本机缓存布局一致。`/` 放不下，直接下到 /tank 再软链：
 
 ```bash
+mkdir -p /tank/bagel_data
 export HF_ENDPOINT=https://hf-mirror.com
-export HF_HOME=/root/bagel/hf_home    # 或 /tank/bagel_data/hf_home 后软链到 /root/bagel/hf_home
+export HF_HOME=/tank/bagel_data/hf_home
 huggingface-cli download --repo-type dataset yifanzhang114/MME-RealWorld-Base64
+ln -s /tank/bagel_data/hf_home /root/bagel/hf_home
 ```
 
-校验：`hf_home/hub/datasets--yifanzhang114--MME-RealWorld-Base64/blobs/` 总量 ≈ 41G。
+校验：`/root/bagel/hf_home/hub/datasets--yifanzhang114--MME-RealWorld-Base64/blobs/` 总量 ≈ 41G。
 注意：主文件 MME-RealWorld.tsv 单文件 33G，下载脚本要有断点续传/重试（huggingface-cli 自带续传）。
 
 ## 4. mplug 评分模型（2.8G）→ `cache/modelscope/`
@@ -69,16 +85,18 @@ modelscope download --model damo/mplug_visual-question-answering_coco_large_en \
   --local_dir /root/bagel/cache/modelscope/models/damo--mplug_visual-question-answering_coco_large_en/snapshots/master
 ```
 
-## 5. LMUData 评测数据集（42G）→ `LMUData/`（仅跑 VLMEvalKit 基准时需要，建议放 /tank）
+## 5. LMUData 评测数据集（42G）→ 软链 `LMUData/`（仅跑 VLMEvalKit 基准时需要，实体放 /tank）
 
 由 VLMEvalKit 自动下载。先克隆第三方仓库（已 gitignore，不在本仓库内）：
 
 ```bash
 git clone https://github.com/open-compass/VLMEvalKit.git /root/bagel/VLMEvalKit
+mkdir -p /tank/bagel_data/LMUData
+ln -s /tank/bagel_data/LMUData /root/bagel/LMUData
 ```
 
-跑评测时设置 `LMUData` 目录并按 VLMEvalKit 文档执行，数据集会自动落到
-`/root/bagel/LMUData/`（本机口径；空间不足时放 /tank 再软链）。
+之后按 VLMEvalKit 文档跑评测，数据集会自动落到软链指向的
+`/tank/bagel_data/LMUData/`（脚本看到的路径仍是 `/root/bagel/LMUData/`，与本机口径一致）。
 
 ## 6. flash-attn（通常无需处理）
 
