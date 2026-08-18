@@ -17,6 +17,10 @@ gen_eval/ELLA/
 # 生成评测的图片输出与大体积数据集文件
 gen_eval/images/
 gen_eval/prompts/qwen_image_bench_hf_v0518.jsonl
+# 目录搬迁后补充：带斜杠的锚定规则只匹配仓库根，projects/bagel 下需显式重复
+projects/bagel/gen_eval/images/
+projects/bagel/gen_eval/ELLA/
+projects/bagel/gen_eval/prompts/qwen_image_bench_hf_v0518.jsonl
 
 # 示例输出
 bagel_example/
